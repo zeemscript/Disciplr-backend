@@ -1,16 +1,92 @@
+import { getEnv } from '../config/env.js'
 import { getPrisma } from '../lib/prismaScope.js'
 import { hashPassword, comparePassword, generateAccessToken, generateRefreshToken, verifyRefreshToken, hashToken } from '../lib/auth-utils.js'
+import { createAuditLog } from '../lib/audit-logs.js'
 import { RegisterInput, LoginInput } from '../lib/validation.js'
 import { UserRole } from '../types/user.js'
 import { randomUUID } from 'node:crypto'
 import { recordSession, revokeAllUserSessions } from './session.js'
 
 const STEP_UP_TTL_SECONDS = 5 * 60
-const STEP_UP_NONCES = new Map<string, { userId: string; expiresAt: number; used: boolean }>()
+const STEP_UP_NONCES = new Map<string, { userId: string; action?: string; expiresAt: number; used: boolean }>()
+const BREACHED_PASSWORDS_ENV = 'AUTH_BREACHED_PASSWORDS'
+const BREACHED_PASSWORDS_ENABLED_ENV = 'AUTH_BREACHED_PASSWORDS_ENABLED'
+
+const parseBooleanEnv = (value?: string): boolean => {
+    if (!value) return false
+    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
+}
+
+const getBreachedPasswordSet = (): Set<string> => {
+    const rawValue = process.env[BREACHED_PASSWORDS_ENV] ?? ''
+    return new Set(rawValue.split(',').map((entry) => entry.trim().toLowerCase()).filter(Boolean))
+}
+
+const isBreachedPasswordCheckEnabled = (): boolean => {
+    if (parseBooleanEnv(process.env[BREACHED_PASSWORDS_ENABLED_ENV])) return true
+    if (process.env[BREACHED_PASSWORDS_ENABLED_ENV] === undefined) {
+        return Boolean(process.env[BREACHED_PASSWORDS_ENV])
+    }
+    return false
+}
 
 export class AuthService {
+    private static async emitSecurityAudit(action: string, targetType: string, targetId: string, metadata: Record<string, unknown>, actorUserId = 'system') {
+        try {
+            await createAuditLog({
+                actor_user_id: actorUserId,
+                action,
+                target_type: targetType,
+                target_id: targetId,
+                metadata,
+            })
+        } catch {
+            // Security audit failures should never block the authentication flow.
+        }
+    }
+
+    private static async ensurePasswordIsAllowed(password: string, context: { userId?: string; email?: string }) {
+        if (!isBreachedPasswordCheckEnabled()) {
+            return
+        }
+
+        const normalizedPassword = password.trim().toLowerCase()
+        if (!normalizedPassword) {
+            return
+        }
+
+        const breachedPasswords = getBreachedPasswordSet()
+        if (!breachedPasswords.has(normalizedPassword)) {
+            return
+        }
+
+        const actorUserId = context.userId ?? 'system'
+        const targetId = context.userId ?? context.email ?? 'unknown'
+        await this.emitSecurityAudit('auth.password_rejected', 'user', targetId, {
+            reason: 'breached_password',
+            email: context.email,
+        }, actorUserId)
+
+        throw new Error('Password rejected')
+    }
+
+    private static async revokeRefreshTokenFamily(userId: string, token: string) {
+        const tokenHash = hashToken(token)
+        const now = new Date()
+        await getPrisma().refreshToken.updateMany({
+            where: { userId },
+            data: { revokedAt: now },
+        })
+        await revokeAllUserSessions(userId)
+        await this.emitSecurityAudit('auth.refresh_token_reuse_detected', 'refresh_token', userId, {
+            reason: 'refresh_token_reuse',
+            tokenFingerprint: tokenHash.slice(0, 12),
+        }, userId)
+    }
+
     static async register(input: RegisterInput) {
         try {
+            await this.ensurePasswordIsAllowed(input.password, { email: input.email })
             const hashedPassword = await hashPassword(input.password)
             const user = await getPrisma().user.create({
                 data: {
@@ -29,10 +105,34 @@ export class AuthService {
         }
     }
 
+    static async changePassword(userId: string, newPassword: string) {
+        const prisma = getPrisma()
+        const user = await prisma.user.findUnique({ where: { id: userId } })
+        if (!user) {
+            throw new Error('User not found')
+        }
+
+        await this.ensurePasswordIsAllowed(newPassword, { userId, email: user.email })
+        const hashedPassword = await hashPassword(newPassword)
+        const updatedUser = await prisma.user.update({
+            where: { id: userId },
+            data: { passwordHash: hashedPassword },
+        })
+
+        return { id: updatedUser.id, email: updatedUser.email, role: updatedUser.role }
+    }
+
     static async login(input: LoginInput) {
         const prisma = getPrisma()
         const user = await prisma.user.findUnique({ where: { email: input.email } })
         if (!user) {
+            throw new Error('Invalid credentials')
+        }
+
+        // Soft-deleted or non-active accounts are never allowed to authenticate,
+        // regardless of password correctness — fail closed.
+        const isActive = typeof user.status !== 'string' || user.status === 'ACTIVE'
+        if (user.deletedAt || !isActive) {
             throw new Error('Invalid credentials')
         }
 
@@ -44,12 +144,13 @@ export class AuthService {
         const jti = randomUUID()
         const sessionId = randomUUID()
         const lastLoginAt = new Date()
-        const accessToken = generateAccessToken({ userId: user.id, role: user.role, jti })
-        const refreshTokenValue = generateRefreshToken({ userId: user.id })
+        const env = getEnv()
+        const accessToken = generateAccessToken({ userId: user.id, role: user.role, jti }, env)
+        const refreshTokenValue = generateRefreshToken({ userId: user.id }, env)
         const accessExpiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15 minutes
         const tokenHash = hashToken(refreshTokenValue)
 
-        const loggedInUser = await prisma.$transaction(async (tx) => {
+        const loggedInUser = await prisma.$transaction(async (tx: any) => {
             const updatedUser = await tx.user.update({
                 where: { id: user.id },
                 data: { lastLoginAt },
@@ -80,7 +181,7 @@ export class AuthService {
 
     static async refresh(token: string) {
         try {
-            const payload = verifyRefreshToken(token)
+            const payload = verifyRefreshToken(token, getEnv())
 
             // Look up by hash — we never store the raw token
             const tokenHash = hashToken(token)
@@ -89,8 +190,13 @@ export class AuthService {
                 include: { user: true },
             })
 
-            if (!storedToken || storedToken.revokedAt || storedToken.expiresAt < new Date()) {
+            if (!storedToken) {
                 throw new Error('Invalid or expired refresh token')
+            }
+
+            if (storedToken.revokedAt || storedToken.expiresAt < new Date()) {
+                await this.revokeRefreshTokenFamily(storedToken.user.id, token)
+                throw new Error('Invalid refresh token')
             }
 
             // Revoke old token BEFORE issuing new ones (no dual-valid window)
@@ -100,8 +206,9 @@ export class AuthService {
             })
 
             const jti = randomUUID()
-            const newAccessToken = generateAccessToken({ userId: storedToken.user.id, role: storedToken.user.role, jti })
-            const newRefreshTokenValue = generateRefreshToken({ userId: storedToken.user.id })
+            const env = getEnv()
+            const newAccessToken = generateAccessToken({ userId: storedToken.user.id, role: storedToken.user.role, jti }, env)
+            const newRefreshTokenValue = generateRefreshToken({ userId: storedToken.user.id }, env)
 
             // 1. Record new session for access token
             const accessExpiresAt = new Date(Date.now() + 15 * 60 * 1000)
@@ -149,10 +256,10 @@ export class AuthService {
         await revokeAllUserSessions(userId)
     }
 
-    static async issueStepUpChallenge(userId: string) {
+    static async issueStepUpChallenge(userId: string, action?: string) {
         const nonce = randomUUID()
         const expiresAt = Date.now() + STEP_UP_TTL_SECONDS * 1000
-        STEP_UP_NONCES.set(nonce, { userId, expiresAt, used: false })
+        STEP_UP_NONCES.set(nonce, { userId, action, expiresAt, used: false })
 
         return {
             nonce,
@@ -173,7 +280,7 @@ export class AuthService {
         return true
     }
 
-    static async validateStepUpSession(sessionId: string, maxAgeSeconds = STEP_UP_TTL_SECONDS) {
+    static async validateStepUpSession(sessionId: string, maxAgeSeconds = STEP_UP_TTL_SECONDS, action?: string) {
         const entry = STEP_UP_NONCES.get(sessionId)
         if (!entry || entry.used || entry.expiresAt < Date.now()) {
             return null
@@ -185,26 +292,25 @@ export class AuthService {
             return null
         }
 
+        if (action && entry.action && entry.action !== action) {
+            return null
+        }
+
         entry.used = true
         STEP_UP_NONCES.delete(sessionId)
         return { userId: entry.userId, sessionId }
     }
 
     static async registerWebAuthnCredential(userId: string, credentialId: string, publicKey: string) {
-        const existing = await getPrisma().$queryRaw<{ credential_id: string }[]>`
-            SELECT "credential_id" FROM "webauthn_credentials"
-            WHERE "credential_id" = ${credentialId}
-            LIMIT 1
-        `
-
-        if (existing.length > 0) {
-            throw new Error('Credential already registered')
-        }
-
-        await getPrisma().$executeRaw`
+        // The unique credential_id index is the synchronization point. An
+        // existence check followed by INSERT races under concurrent requests.
+        const inserted = await getPrisma().$executeRaw`
             INSERT INTO "webauthn_credentials" ("user_id", "credential_id", "public_key", "counter")
             VALUES (${userId}, ${credentialId}, ${publicKey}, 0)
+            ON CONFLICT ("credential_id") DO NOTHING
         `
+
+        if (inserted === 0) throw new Error('Credential already registered')
 
         return { userId, credentialId, publicKey }
     }
@@ -235,4 +341,3 @@ export class AuthService {
         return { credentialId, counter: newCounter }
     }
 }
-

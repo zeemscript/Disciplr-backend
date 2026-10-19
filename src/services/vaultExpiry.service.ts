@@ -10,6 +10,7 @@ import {
 } from './digestRenderer.js'
 import { isInQuietHours, getQuietHoursEndUTC } from '../utils/quietHours.js'
 import type { MilestoneReminderItem, DigestPayload } from '../types/notification.js'
+import { normalizeTimestamp, toUTCDate } from '../utils/timestamps.js'
 
 // Configurable lead times in milliseconds (72h, 24h, 1h by default)
 const DEFAULT_LEAD_TIMES_MS = [
@@ -48,7 +49,8 @@ export const markVaultExpiries = async (
       type: 'vault_failure',
       title: 'Vault Deadline Reached',
       message: 'A vault in your account has expired and been marked as failed.',
-      data: { vaultId: vault.id }
+      data: { vaultId: vault.id },
+      organization_id: vault.organization_id
     })
   }
 
@@ -71,6 +73,7 @@ export const sendMilestoneReminders = async (
     .select(
       'vaults.id as vault_id',
       'vaults.creator as user_id',
+      'vaults.organization_id as organization_id',
       'milestones.id as milestone_id',
       'milestones.title as milestone_title',
       'milestones.due_date'
@@ -81,7 +84,7 @@ export const sendMilestoneReminders = async (
   for (const vm of vaultMilestones) {
     if (opts.limit && remindersSent >= opts.limit) break
 
-    const dueDate = new Date(vm.due_date)
+    const dueDate = toUTCDate(vm.due_date)
     const dueDateMs = dueDate.getTime()
     const timeUntilDue = dueDateMs - nowMs
 
@@ -102,13 +105,14 @@ export const sendMilestoneReminders = async (
             type: 'milestone_reminder',
             title: `Milestone Reminder: ${vm.milestone_title}`,
             message: `Your milestone is due in ${leadTimeText}! Don't forget to check in before the deadline to avoid a slash.`,
-            data: { 
-              vaultId: vm.vault_id, 
-              milestoneId: vm.milestone_id, 
-              dueDate: vm.due_date,
-              leadTimeMs 
+            data: {
+              vaultId: vm.vault_id,
+              milestoneId: vm.milestone_id,
+              dueDate: normalizeTimestamp(vm.due_date),
+              leadTimeMs
             },
-            idempotency_key: idempotencyKey
+            idempotency_key: idempotencyKey,
+            organization_id: vm.organization_id
           })
           remindersSent++
         } catch (err) {
@@ -161,7 +165,7 @@ export const sendMilestoneDigestReminders = async (
   const seenMilestoneKeys = new Set<string>()
 
   for (const vm of vaultMilestones) {
-    const dueDate = new Date(vm.due_date)
+    const dueDate = toUTCDate(vm.due_date)
     const dueDateMs = dueDate.getTime()
     const timeUntilDue = dueDateMs - nowMs
 
@@ -188,7 +192,7 @@ export const sendMilestoneDigestReminders = async (
           vault_id: vm.vault_id,
           milestone_id: vm.milestone_id,
           milestone_title: vm.milestone_title,
-          due_date: vm.due_date,
+          due_date: normalizeTimestamp(vm.due_date),
           lead_time_ms: leadTimeMs,
           lead_time_text: formatLeadTime(leadTimeMs),
         }
@@ -256,7 +260,7 @@ export const sendMilestoneDigestReminders = async (
             data: {
               vaultId: item.vault_id,
               milestoneId: item.milestone_id,
-              dueDate: item.due_date,
+              dueDate: normalizeTimestamp(item.due_date),
               leadTimeMs: item.lead_time_ms,
               deferredUntil: deliverAfter.toISOString(),
             },
@@ -287,7 +291,7 @@ export const sendMilestoneDigestReminders = async (
           data: {
             vaultId: item.vault_id,
             milestoneId: item.milestone_id,
-            dueDate: item.due_date,
+            dueDate: normalizeTimestamp(item.due_date),
             leadTimeMs: item.lead_time_ms,
             digestKey,
           },

@@ -20,16 +20,18 @@ export interface CreateNotificationInput {
   message: string
   data?: NotificationData
   idempotency_key?: string
+  /** Organization the notification is dispatched on behalf of, used to consult notification preferences. */
+  organization_id?: string | null
+  /** Delivery channel consulted against per-org preferences. Defaults to 'email'. */
+  channel?: string
 }
 
 export type NotificationSortField = 'created_at' | 'read_at' | 'title' | 'type'
 export type NotificationReadStatus = 'all' | 'read' | 'unread'
 
 export interface NotificationListOptions {
-  page: number
-  pageSize: number
-  sortBy?: NotificationSortField
-  sortOrder: 'asc' | 'desc'
+  cursor?: string
+  limit: number
   includeArchived?: boolean
   readStatus?: NotificationReadStatus
 }
@@ -37,22 +39,17 @@ export interface NotificationListOptions {
 export interface NotificationListResult {
   data: Notification[]
   pagination: {
-    page: number
-    pageSize: number
-    total: number
-    totalPages: number
-    hasNext: boolean
-    hasPrev: boolean
-  }
-  sort: {
-    sortBy: NotificationSortField
-    sortOrder: 'asc' | 'desc'
+    limit: number
+    cursor: string | null
+    next_cursor?: string
+    has_more: boolean
+    count: number
   }
 }
 
 // User notification preferences for quiet-hours windowing
 export interface UserNotificationPreferences {
-  id: string
+  id: string | null
   user_id: string
   timezone: string
   quiet_hours_enabled: boolean

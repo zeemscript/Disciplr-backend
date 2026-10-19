@@ -5,12 +5,7 @@ import { pool, db } from '../db/index.js';
 import { BackgroundJobSystem } from '../jobs/system.js';
 import { getLatestListenerLag } from '../services/monitor.js';
 import { getBreakerStatesForMetrics } from '../services/webhooks.js';
-
-// Create a Registry which registers the metrics
-const register = new client.Registry();
-
-// Enable collection of default metrics (CPU, memory, event loop, etc.)
-client.collectDefaultMetrics({ register });
+import { register } from '../observability/metricsRegistry.js';
 
 // Define custom gauges
 // Aggregate-only — no tenant/org/user labels to avoid leaking tenant identity
@@ -68,9 +63,35 @@ const webhookBreakerHalfOpenGauge = new client.Gauge({
   registers: [register],
 });
 
+const webhookDispatchInFlightGauge = new client.Gauge({
+  name: 'disciplr_webhook_dispatch_in_flight',
+  help: 'Number of webhook deliveries currently in flight',
+  registers: [register],
+});
+
+const webhookDispatchQueueDepthGauge = new client.Gauge({
+  name: 'disciplr_webhook_dispatch_queue_depth',
+  help: 'Number of webhook deliveries waiting in queue',
+  registers: [register],
+});
+
+const eventThroughputGauge = new client.Gauge({
+  name: 'disciplr_event_throughput_events_per_sec',
+  help: 'Event processing throughput in events per second (batched path)',
+  registers: [register],
+});
+
+/**
+ * Update the event throughput metric from the batch processor.
+ * Called by EventProcessor after each completed batch.
+ */
+export function setEventThroughput(eventsPerSec: number): void {
+  eventThroughputGauge.set(eventsPerSec);
+}
+
 const router = express.Router();
 
-router.get('/metrics', async (_req: Request, res: Response) => {
+router.get('/', async (_req: Request, res: Response) => {
   // Update gauges on each scrape
   // Job system metrics – we need an instance; assume a singleton is attached to app locals
   const jobSystem: BackgroundJobSystem | undefined = (res.app?.locals?.jobSystem as BackgroundJobSystem) ?? undefined;
@@ -115,8 +136,18 @@ router.get('/metrics', async (_req: Request, res: Response) => {
     console.error('Error fetching webhook breaker metrics:', error);
   }
 
+  // Webhook dispatch metrics
+  try {
+    const { webhookDispatcher } = await import('../services/boundedWebhookDispatcher.js');
+    webhookDispatchInFlightGauge.set(webhookDispatcher.getInFlight());
+    webhookDispatchQueueDepthGauge.set(webhookDispatcher.getQueueDepth());
+  } catch (error) {
+    console.error('Error fetching webhook dispatch metrics:', error);
+  }
+
   res.set('Content-Type', register.contentType);
   res.end(await register.metrics());
 });
 
 export const metricsRouter = router;
+export { register as metricsRegistry };

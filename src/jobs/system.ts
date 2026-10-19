@@ -6,12 +6,14 @@ import {
   type QueueDepthReport,
   type SweepResult,
 } from './queue.js'
-import { type EnqueueOptions, type JobPayloadByType, type JobType } from './types.js'
+import type { EnqueueOptions, JobHandler, JobPayloadByType, JobType } from './types.js'
 import { recoverPendingExportJobs } from '../services/exportQueue.js'
+import { listOrganizations } from '../services/organization.js'
 import {
   createNotificationService,
   type NotificationService,
 } from '../services/notifications/factory.js'
+import type { AbuseMonitor } from '../services/abuse-monitor.js'
 import db from '../db/index.js'
 import { getPgPool } from '../db/pool.js'
 import { MilestoneRepository } from '../repositories/milestoneRepository.js'
@@ -29,6 +31,31 @@ const parsePositiveInteger = (value: string | undefined, fallback: number): numb
   }
 
   return Math.floor(parsed)
+}
+
+const REGISTERED_JOB_TYPES: readonly JobType[] = [
+  'notification.send',
+  'deadline.check',
+  'oracle.call',
+  'analytics.recompute',
+  'analytics.report.generate',
+  'export.generate',
+  'sessions.cleanup',
+  'vault.reconcile',
+  'outbox.relay',
+  'embeddings.reindex',
+  'milestone.reminders',
+  'milestone.reminders.digest',
+  'milestone.reminders.deferred',
+  'retention.purge',
+  'saved-search.evaluate',
+  'settlement.process',
+]
+
+const assertJobId = (jobId: string): void => {
+  if (typeof jobId !== 'string' || jobId.trim().length === 0) {
+    throw new TypeError('jobId must be a non-empty string')
+  }
 }
 
 /**
@@ -166,12 +193,15 @@ class SchedulerRegistry {
 export class BackgroundJobSystem {
   private readonly queue: InMemoryJobQueue
   private readonly schedulerRegistry: SchedulerRegistry
+  private readonly abuseMonitor?: AbuseMonitor
+  private readonly registeredJobTypes = new Set<JobType>(REGISTERED_JOB_TYPES)
   private started = false
   private shuttingDown = false
 
   constructor(
     notificationService?: NotificationService,
     embeddingReindex?: EmbeddingReindexDependencies,
+    abuseMonitor?: AbuseMonitor,
   ) {
     this.queue = new InMemoryJobQueue({
       concurrency: parsePositiveInteger(process.env.JOB_WORKER_CONCURRENCY, 2),
@@ -180,6 +210,7 @@ export class BackgroundJobSystem {
       staleLeaseMs: parsePositiveInteger(process.env.JOB_STALE_LEASE_MS, 300_000),
     })
     this.schedulerRegistry = new SchedulerRegistry()
+    this.abuseMonitor = abuseMonitor
 
     const resolvedNotificationService =
       notificationService ?? createNotificationService(process.env.NOTIFICATION_PROVIDER ?? 'console')
@@ -188,16 +219,21 @@ export class BackgroundJobSystem {
       cursorStore: new BackfillCursorStore(db),
       embeddingProvider: createEmbeddingProvider(),
     }
-    const handlers = createDefaultJobHandlers(resolvedNotificationService, resolvedEmbeddingReindex)
+    const handlers = createDefaultJobHandlers(
+      resolvedNotificationService,
+      resolvedEmbeddingReindex,
+      (type, payload, options) => this.enqueue(type, payload, options),
+    )
 
-    this.queue.registerHandler('notification.send', handlers['notification.send'])
-    this.queue.registerHandler('deadline.check', handlers['deadline.check'])
-    this.queue.registerHandler('oracle.call', handlers['oracle.call'])
-    this.queue.registerHandler('analytics.recompute', handlers['analytics.recompute'])
-    this.queue.registerHandler('export.generate', handlers['export.generate'])
-    this.queue.registerHandler('sessions.cleanup', handlers['sessions.cleanup'])
-    this.queue.registerHandler('outbox.relay', handlers['outbox.relay'])
-    this.queue.registerHandler('embeddings.reindex', handlers['embeddings.reindex'])
+    // Register all job handlers explicitly — never rely on Object.entries
+    // which can silently skip handlers if createDefaultJobHandlers misses one.
+    for (const jobType of REGISTERED_JOB_TYPES) {
+      const handler = handlers[jobType]
+      if (!handler) {
+        throw new Error(`Missing handler for job type: ${jobType}`)
+      }
+      this.queue.registerHandler<JobType>(jobType, handler as JobHandler<JobType>)
+    }
   }
 
   start(): void {
@@ -231,14 +267,22 @@ export class BackgroundJobSystem {
     if (this.shuttingDown) {
       throw new Error('Cannot enqueue job: system is shutting down')
     }
+    if (!this.registeredJobTypes.has(type)) {
+      throw new TypeError(`Cannot enqueue unregistered job type: ${type}`)
+    }
     return this.queue.enqueue(type, payload, options)
   }
 
   getDeadLetters() {
-    return this.queue.getDeadLetters()
+    return this.queue.getDeadLetters().map((deadLetter) => ({ ...deadLetter }))
+  }
+
+  getRegisteredJobTypes(): readonly JobType[] {
+    return Array.from(this.registeredJobTypes)
   }
 
   getDeadLetter(jobId: string) {
+    assertJobId(jobId)
     return this.queue.getDeadLetter(jobId)
   }
 
@@ -246,6 +290,7 @@ export class BackgroundJobSystem {
     if (this.shuttingDown) {
       throw new Error('Cannot replay dead-letter job: system is shutting down')
     }
+    assertJobId(jobId)
     return this.queue.replayDeadLetter(jobId)
   }
 
@@ -253,7 +298,22 @@ export class BackgroundJobSystem {
     if (this.shuttingDown) {
       throw new Error('Cannot retry job: system is shutting down')
     }
+    assertJobId(jobId)
+    if (typeof force !== 'boolean') {
+      throw new TypeError('retryJob force must be a boolean')
+    }
     return this.queue.retryJob(jobId, force)
+  }
+
+  cancelJob(jobId: string, reason?: string): void {
+    if (this.shuttingDown) {
+      throw new Error('Cannot cancel job: system is shutting down')
+    }
+    this.queue.cancelJob(jobId, reason)
+  }
+
+  getCancelledJobs() {
+    return this.queue.getCancelledJobs()
   }
 
   getMetrics(): QueueMetrics {
@@ -296,6 +356,26 @@ export class BackgroundJobSystem {
       process.env.EMBEDDING_REINDEX_INTERVAL_MS,
       600_000, // 10 minutes
     )
+    const savedSearchEvalIntervalMs = parsePositiveInteger(
+      process.env.SAVED_SEARCH_EVAL_INTERVAL_MS,
+      15 * 60_000, // 15 minutes
+    )
+    const analyticsReportIntervalMs = parsePositiveInteger(
+      process.env.ANALYTICS_REPORT_INTERVAL_MS,
+      24 * 60 * 60_000, // 24 hours
+    )
+    const milestoneRemindersIntervalMs = parsePositiveInteger(
+      process.env.MILESTONE_REMINDERS_INTERVAL_MS,
+      15 * 60_000, // 15 minutes
+    )
+    const milestoneRemindersDigestIntervalMs = parsePositiveInteger(
+      process.env.MILESTONE_REMINDERS_DIGEST_INTERVAL_MS,
+      15 * 60_000, // 15 minutes
+    )
+    const milestoneRemindersDeferredIntervalMs = parsePositiveInteger(
+      process.env.MILESTONE_REMINDERS_DEFERRED_INTERVAL_MS,
+      5 * 60_000, // 5 minutes
+    )
 
     this.schedulerRegistry.registerJob({
       name: 'deadline.check',
@@ -329,6 +409,36 @@ export class BackgroundJobSystem {
       },
     })
 
+    const retentionPurgeIntervalMs = parsePositiveInteger(
+      process.env.RETENTION_PURGE_INTERVAL_MS,
+      86_400_000,
+    )
+    const retentionPurgeBatchSize = parsePositiveInteger(
+      process.env.RETENTION_PURGE_BATCH_SIZE,
+      500,
+    )
+
+    this.schedulerRegistry.registerJob({
+      name: 'retention.purge',
+      intervalMs: retentionPurgeIntervalMs,
+      immediate: true,
+      initialDelayMs: 20_000,
+      execute: async () => {
+        try {
+          const organizations = await listOrganizations()
+          for (const org of organizations) {
+            this.enqueue('retention.purge', {
+              organizationId: org.id,
+              batchSize: retentionPurgeBatchSize,
+            })
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          console.error(`[jobs:retention.purge] failed to enqueue jobs: ${message}`)
+        }
+      },
+    })
+
     this.schedulerRegistry.registerJob({
       name: 'outbox.relay',
       intervalMs: outboxRelayIntervalMs,
@@ -348,5 +458,84 @@ export class BackgroundJobSystem {
         this.enqueue('embeddings.reindex', {})
       },
     })
+
+    this.schedulerRegistry.registerJob({
+      name: 'saved-search.evaluate',
+      intervalMs: savedSearchEvalIntervalMs,
+      immediate: false,
+      execute: () => {
+        this.enqueue('saved-search.evaluate', {})
+      },
+    })
+
+    const settlementProcessIntervalMs = parsePositiveInteger(
+      process.env.SETTLEMENT_PROCESS_INTERVAL_MS,
+      30_000,
+    )
+    this.schedulerRegistry.registerJob({
+      name: 'settlement.process',
+      intervalMs: settlementProcessIntervalMs,
+      immediate: true,
+      initialDelayMs: 2_000,
+      execute: () => {
+        this.enqueue('settlement.process', { batchSize: 20 })
+      },
+    })
+
+    this.schedulerRegistry.registerJob({
+      name: 'milestone.reminders',
+      intervalMs: milestoneRemindersIntervalMs,
+      immediate: true,
+      initialDelayMs: 5_000,
+      execute: () => {
+        this.enqueue('milestone.reminders', {})
+      },
+    })
+
+    this.schedulerRegistry.registerJob({
+      name: 'milestone.reminders.digest',
+      intervalMs: milestoneRemindersDigestIntervalMs,
+      immediate: true,
+      initialDelayMs: 10_000,
+      execute: () => {
+        this.enqueue('milestone.reminders.digest', {})
+      },
+    })
+
+    this.schedulerRegistry.registerJob({
+      name: 'milestone.reminders.deferred',
+      intervalMs: milestoneRemindersDeferredIntervalMs,
+      immediate: true,
+      initialDelayMs: 15_000,
+      execute: () => {
+        this.enqueue('milestone.reminders.deferred', {})
+      },
+    })
+
+    this.schedulerRegistry.registerJob({
+      name: 'analytics.report.generate',
+      intervalMs: analyticsReportIntervalMs,
+      immediate: false,
+      execute: () => {
+        this.enqueue('analytics.report.generate', {})
+      },
+    })
+
+    if (this.abuseMonitor) {
+      const abuseMonitorCleanupIntervalMs = parsePositiveInteger(
+        process.env.ABUSE_MONITOR_CLEANUP_INTERVAL_MS,
+        300_000, // 5 minutes
+      )
+
+      this.schedulerRegistry.registerJob({
+        name: 'abuse-monitor.cleanup',
+        intervalMs: abuseMonitorCleanupIntervalMs,
+        immediate: false,
+        initialDelayMs: 30_000,
+        execute: () => {
+          this.abuseMonitor!.cleanup()
+        },
+      })
+    }
   }
 }

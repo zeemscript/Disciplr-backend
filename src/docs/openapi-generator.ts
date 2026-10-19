@@ -44,7 +44,7 @@ registry.registerComponent('securitySchemes', 'bearerAuth', {
 })
 
 // --- Shared Schemas ---
-const PaginationCursor = registry.registerComponent('schemas', 'PaginationCursor', z.object({
+const PaginationCursor = registry.register('PaginationCursor', z.object({
   limit: z.number(),
   cursor: z.string().optional(),
   next_cursor: z.string().optional(),
@@ -52,7 +52,7 @@ const PaginationCursor = registry.registerComponent('schemas', 'PaginationCursor
   count: z.number(),
 }))
 
-const ErrorEnvelope = registry.registerComponent('schemas', 'ErrorEnvelope', z.object({
+const ErrorEnvelope = registry.register('ErrorEnvelope', z.object({
   error: z.object({
     code: z.string().openapi({ example: 'VALIDATION_ERROR' }),
     message: z.string().openapi({ example: 'Invalid request parameters' }),
@@ -616,12 +616,14 @@ registry.registerPath({
       schema: { type: 'string' },
     },
   ],
-  requestBody: {
-    content: {
-      'application/json': {
-        schema: z.object({
-          role: z.enum(['USER', 'VERIFIER', 'ADMIN']),
-        }),
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            role: z.enum(['USER', 'VERIFIER', 'ADMIN']),
+          }),
+        },
       },
     },
   },
@@ -647,12 +649,14 @@ registry.registerPath({
       schema: { type: 'string' },
     },
   ],
-  requestBody: {
-    content: {
-      'application/json': {
-        schema: z.object({
-          status: z.enum(['ACTIVE', 'INACTIVE', 'SUSPENDED']),
-        }),
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            status: z.enum(['ACTIVE', 'INACTIVE', 'SUSPENDED']),
+          }),
+        },
       },
     },
   },
@@ -797,23 +801,25 @@ registry.registerPath({
       schema: { type: 'string' },
     },
   ],
-  requestBody: {
-    content: {
-      'application/json': {
-        schema: z.object({
-          reasonCode: z.enum([
-            'USER_REQUEST',
-            'FRAUD_DETECTED',
-            'SYSTEM_ERROR',
-            'POLICY_VIOLATION',
-            'EMERGENCY_ADMIN_ACTION',
-            'COMPLIANCE_REQUIREMENT',
-            'TESTING_CLEANUP',
-          ]),
-          reason: z.string().optional(),
-          idempotencyKey: z.string().optional(),
-          details: z.string().optional(),
-        }),
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            reasonCode: z.enum([
+              'USER_REQUEST',
+              'FRAUD_DETECTED',
+              'SYSTEM_ERROR',
+              'POLICY_VIOLATION',
+              'EMERGENCY_ADMIN_ACTION',
+              'COMPLIANCE_REQUIREMENT',
+              'TESTING_CLEANUP',
+            ]),
+            reason: z.string().optional(),
+            idempotencyKey: z.string().optional(),
+            details: z.string().optional(),
+          }),
+        },
       },
     },
   },

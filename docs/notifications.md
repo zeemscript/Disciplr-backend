@@ -70,6 +70,28 @@ Milestone reminders use the `milestone_reminder` notification type and include:
 - Milestone ID
 - Due date
 
+## Per-Organization Notification Preferences
+
+`src/services/notification.ts` consults per-organization preferences before dispatching a vault deadline reminder or lifecycle alert (`createNotification`). An org with no stored preferences behaves exactly as before — every category and channel is enabled by default.
+
+### Data Model
+
+Preferences are stored in the `org_notification_preferences` table (see `src/models/notificationPreferences.ts`), one row per `(organization_id, category, channel)`:
+
+- **Category toggle**: a row with a known category (e.g. `vault_failure`, `milestone_reminder`) disables just that category on the given channel.
+- **Channel opt-out**: a row with the empty-string category sentinel disables every category on that channel, unless a category-specific row overrides it.
+
+Known categories: `vault_failure`, `milestone_reminder`. Known channels: `email`.
+
+### API
+
+- `GET /api/orgs/:orgId/notification-preferences` — any org member can view the resolved preferences (`{ organizationId, categories, channels }`).
+- `PUT /api/orgs/:orgId/notification-preferences` — owners/admins can update preferences by sending `{ categories?: { [category]: boolean }, channels?: { [channel]: boolean } }`. Unknown category or channel names are rejected with `400`.
+
+### Dispatch Behavior
+
+`createNotification` resolves the notification's `organization_id` and `channel` (defaults to `'email'`) and skips insertion entirely (returning `null`) when the category or channel is disabled for that org. Notifications without an `organization_id` are never suppressed.
+
 ## Observability
 
 - **Metrics**: Queue metrics can be accessed via `GET /api/jobs/metrics`.

@@ -1,0 +1,264 @@
+// Disciplr public API (Vercel serverless entry). Express app, JSON over HTTP.
+import express from 'express'
+import cors from 'cors'
+import { randomBytes } from 'node:crypto'
+import { getStore as defaultGetStore, StoreConflictError } from '../apilib/store.mjs'
+import { checkReadiness, isDatabaseUnavailable } from '../apilib/store-bootstrap.mjs'
+import { OPENAPI } from '../apilib/openapi.mjs'
+import { OnchainError, isEnabled, getConfig, getServer, buildCreateVaultTx, buildStakeTx, verifySignedTx, txHashOf, submitAndWait, validateForChain } from '../apilib/soroban.mjs'
+import { safeCompare, expireOverdueVaults } from '../apilib/expiry.mjs'
+
+export function createApp(getStore = defaultGetStore) {
+  const app = express()
+  app.disable('x-powered-by')
+  app.use(cors())
+  app.use(express.json({ limit: '100kb' }))
+
+  const STELLAR = /^G[A-Z2-7]{55}$/
+  const hex = (n) => randomBytes(n).toString('hex')
+  const bad = (res, msg, code = 400) => res.status(code).json({ error: msg })
+  const wrap = (fn) => (req, res) => fn(req, res).catch((e) => {
+    if (isDatabaseUnavailable(e)) {
+      return res.set('Retry-After', '1').status(503).json({ error: 'Database unavailable' })
+    }
+    if (e instanceof StoreConflictError) return res.status(409).json({ error: e.message })
+    if (e instanceof OnchainError) return res.status(e.status).json({ error: e.message, ...(e.contractError && { contractError: e.contractError }) })
+    console.error('API request failed')
+    res.status(500).json({ error: 'Internal error' })
+  })
+
+  const router = express.Router()
+
+  router.get('/health', (_req, res) => {
+    res.json({ status: 'ok', service: 'disciplr-api', time: new Date().toISOString() })
+  })
+  router.get('/ready', wrap(async (_req, res) => {
+    res.json({ status: 'ok', ...await checkReadiness(await getStore()) })
+  }))
+  router.get('/openapi.json', (_req, res) => res.json(OPENAPI))
+
+  router.get('/vaults', wrap(async (req, res) => {
+    const s = await getStore()
+    const vaults = await s.listVaults({ creator: req.query.creator, status: req.query.status })
+    res.json({ data: vaults, count: vaults.length })
+  }))
+
+  router.get('/vaults/:id', wrap(async (req, res) => {
+    const s = await getStore()
+    const v = await s.getVault(req.params.id)
+    if (!v) return bad(res, 'Vault not found', 404)
+    res.json({ data: { ...v, activity: await s.listActivity({ vaultId: v.id }) } })
+  }))
+
+  router.post('/vaults', wrap(async (req, res) => {
+    const b = req.body || {}
+    const errs = []
+    if (!STELLAR.test(b.creator || '')) errs.push('creator must be a Stellar public key (G..., 56 chars)')
+    if (!STELLAR.test(b.verifier || '')) errs.push('verifier must be a Stellar public key')
+    const amount = Number(b.amount)
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1e12) errs.push('amount must be a positive number')
+    const end = new Date(b.endDate); const start = b.startDate ? new Date(b.startDate) : new Date()
+    if (isNaN(end) || isNaN(start) || end <= start) errs.push('endDate must be a valid date after startDate')
+    const ms = Array.isArray(b.milestones) ? b.milestones : []
+    if (ms.length < 1 || ms.length > 20) errs.push('between 1 and 20 milestones are required')
+    const milestones = ms.map((m, i) => ({
+      id: '', title: String(m?.title || '').trim().slice(0, 200), amount: String(Number(m?.amount)),
+      dueDate: new Date(m?.dueDate || b.endDate).toISOString(), status: 'pending', _i: i,
+    }))
+    milestones.forEach((m, i) => {
+      if (!m.title) errs.push(`milestone ${i + 1}: title is required`)
+      if (!(Number(m.amount) >= 0)) errs.push(`milestone ${i + 1}: amount must be >= 0`)
+      if (isNaN(new Date(m.dueDate))) errs.push(`milestone ${i + 1}: invalid dueDate`)
+    })
+    if (errs.length) return res.status(400).json({ error: 'Validation failed', details: errs })
+    const id = 'vault-' + hex(6)
+    milestones.forEach((m, i) => { m.id = `${id}-m${i + 1}`; delete m._i })
+    const now = new Date().toISOString()
+    const s = await getStore()
+    const chain = isEnabled()
+    const vault = {
+      id, name: String(b.name || '').trim().slice(0, 200) || `Vault ${amount}`, creator: b.creator, amount: String(amount), status: chain ? 'draft' : 'active', onchainStatus: chain ? 'pending_onchain' : null, startDate: start.toISOString(), endDate: end.toISOString(),
+      verifier: b.verifier, successDestination: STELLAR.test(b.successDestination || '') ? b.successDestination : b.creator,
+      failureDestination: STELLAR.test(b.failureDestination || '') ? b.failureDestination : b.verifier,
+      createdAt: now, updatedAt: now, milestones,
+    }
+    if (chain) {
+      // Build + simulate first so an invalid vault is rejected before anything is stored.
+      const cfg = getConfig()
+      validateForChain(vault)
+      const onChain = await buildCreateVaultTx(getServer(cfg), cfg, vault)
+      await s.createVault(vault)
+      return res.status(201).json({ data: vault, onChain })
+    }
+    await s.createVault(vault)
+    await s.addActivity({ id: crypto.randomUUID(), type: 'create', vaultId: id, amount: vault.amount, status: 'simulated', hash: hex(32), memo: 'Vault created', createdAt: now })
+    res.status(201).json({ data: vault })
+  }))
+
+  // Build the unsigned stake invocation for a vault whose create_vault is confirmed on-chain.
+  router.post('/vaults/:id/onchain/stake', wrap(async (req, res) => {
+    if (!isEnabled()) return bad(res, 'On-chain mode is disabled', 409)
+    const s = await getStore()
+    const v = await s.getVault(req.params.id)
+    if (!v) return bad(res, 'Vault not found', 404)
+    if (v.onchainStatus === 'active') return bad(res, 'Vault is already active', 409)
+    if (v.onchainStatus !== 'created') return bad(res, 'Vault must be created on-chain before staking', 409)
+    const cfg = getConfig()
+    res.json({ data: v, onChain: await buildStakeTx(getServer(cfg), cfg, v) })
+  }))
+
+  // Accept the creator-signed XDR for create_vault or stake, verify it, relay it and record the real result.
+  router.post('/vaults/:id/onchain/submit', wrap(async (req, res) => {
+    if (!isEnabled()) return bad(res, 'On-chain mode is disabled', 409)
+    const s = await getStore()
+    const v = await s.getVault(req.params.id)
+    if (!v) return bad(res, 'Vault not found', 404)
+    const cfg = getConfig()
+    const { signedXdr, networkPassphrase } = req.body || {}
+    if (typeof signedXdr !== 'string' || !signedXdr) return bad(res, 'signedXdr is required')
+    if (networkPassphrase !== undefined && networkPassphrase !== cfg.networkPassphrase) return bad(res, 'Network passphrase mismatch')
+    const operation = v.onchainStatus === 'pending_onchain' ? 'create_vault' : v.onchainStatus === 'created' ? 'stake' : null
+    // Idempotency is keyed by tx hash: a resubmission of an already-recorded transaction never broadcasts a duplicate row.
+    const probeHash = txHashOf(signedXdr, cfg)
+    let existing = probeHash ? await s.getActivityByHash(probeHash) : null
+    if (existing && existing.vaultId !== v.id) existing = null
+    if (existing && existing.status !== 'pending') return res.status(existing.status === 'failed' ? 422 : 200).json({ data: v, activity: existing })
+    if (!operation) return bad(res, 'Vault is already active', 409)
+    const { tx, hash } = verifySignedTx(signedXdr, v, operation, cfg)
+    const now = new Date().toISOString()
+    const act = existing || await s.addActivity({ id: crypto.randomUUID(), type: operation === 'stake' ? 'stake' : 'create', vaultId: v.id, amount: v.amount, status: 'pending', hash, memo: `${operation} submitted`, ledger: null, createdAt: now })
+    const r = await submitAndWait(getServer(cfg), tx, hash, { resume: !!existing, timeoutMs: Number(process.env.SOROBAN_POLL_TIMEOUT_MS) || 30000, intervalMs: Number(process.env.SOROBAN_POLL_INTERVAL_MS) || 1000 })
+    if (r.status === 'PENDING') return res.status(202).json({ data: v, activity: act })
+    act.ledger = r.ledger ?? null
+    if (r.status === 'SUCCESS') {
+      act.status = 'confirmed'; act.memo = operation === 'stake' ? 'Vault staked' : 'Vault created on-chain'
+      v.onchainStatus = operation === 'stake' ? 'active' : 'created'
+      if (operation === 'stake') v.status = 'active'
+      await s.saveActivity(act); await s.saveVault(v)
+      return res.json({ data: v, activity: act })
+    }
+    act.status = 'failed'; act.memo = `${operation} failed: ${r.error.name}${r.error.message ? ` - ${r.error.message}` : ''}`
+    await s.saveActivity(act)
+    res.status(422).json({ error: `${r.error.name}: ${r.error.message}`, data: v, activity: act })
+  }))
+
+  // Verifier validates a milestone. When every milestone is validated the vault completes and funds release.
+  router.post('/vaults/:id/milestones/:mid/validate', wrap(async (req, res) => {
+    const s = await getStore()
+    const v = await s.getVault(req.params.id)
+    if (!v) return bad(res, 'Vault not found', 404)
+    if (v.status !== 'active') return bad(res, `Vault is ${v.status}`, 409)
+    if (req.body?.verifier !== v.verifier) return bad(res, 'Only the vault verifier may validate milestones', 403)
+    const m = v.milestones.find((x) => x.id === req.params.mid)
+    if (!m) return bad(res, 'Milestone not found', 404)
+    if (m.status === 'completed') return bad(res, 'Milestone already validated', 409)
+
+    const currentTime = req._now || req.query.now || req.headers['x-test-now']
+      ? new Date(req._now || req.query.now || req.headers['x-test-now'])
+      : new Date()
+    if (currentTime > new Date(v.endDate)) {
+      return bad(res, 'Vault deadline has passed', 409)
+    }
+    if (currentTime > new Date(m.dueDate)) {
+      return bad(res, 'Milestone due date has passed', 409)
+    }
+
+    // Re-check and apply under the store's per-vault transition (row locks in Postgres, a per-vault
+    // queue in memory) so concurrent validate/fail requests cannot double-complete or double-release.
+    const now = currentTime.toISOString()
+    const result = await s.transition(v.id, (live) => {
+      if (live.status !== 'active') return { conflict: true, error: `Vault is ${live.status}` }
+      const lm = live.milestones.find((x) => x.id === m.id)
+      if (!lm) return { conflict: true, error: 'Milestone not found' }
+      if (lm.status === 'completed') return { conflict: true, error: 'Milestone already validated' }
+      if (lm.status === 'failed' || lm.status === 'cancelled') return { conflict: true, error: `Milestone is ${lm.status}` }
+      const activities = [{ id: crypto.randomUUID(), type: 'validate', vaultId: live.id, amount: lm.amount, status: 'simulated', hash: hex(32), memo: `Milestone validated: ${lm.title}`, createdAt: now }]
+      let vaultStatus = live.status
+      if (live.milestones.every((x) => x.id === lm.id || x.status === 'completed')) {
+        vaultStatus = 'completed'
+        activities.push({ id: crypto.randomUUID(), type: 'release', vaultId: live.id, amount: live.amount, status: 'simulated', hash: hex(32), memo: 'Funds released to success destination', createdAt: new Date(Date.now() + 1).toISOString() })
+      }
+      return { vaultStatus, milestoneUpdates: [{ id: lm.id, status: 'completed' }], activities }
+    })
+    if (!result) return bad(res, 'Vault not found', 404)
+    res.json({ data: result.vault })
+  }))
+
+  // Verifier (or creator) declares failure: funds redirect to the failure destination.
+  router.post('/vaults/:id/fail', wrap(async (req, res) => {
+    const s = await getStore()
+    const v = await s.getVault(req.params.id)
+    if (!v) return bad(res, 'Vault not found', 404)
+    if (v.status !== 'active') return bad(res, `Vault is ${v.status}`, 409)
+    if (req.body?.verifier !== v.verifier) return bad(res, 'Only the vault verifier may fail a vault', 403)
+    const result = await s.transition(v.id, (live) => {
+      if (live.status !== 'active') return { conflict: true, error: `Vault is ${live.status}` }
+      return {
+        vaultStatus: 'failed',
+        milestoneUpdates: live.milestones.filter((m) => m.status !== 'completed').map((m) => ({ id: m.id, status: 'failed' })),
+        activities: [{ id: crypto.randomUUID(), type: 'redirect', vaultId: live.id, amount: live.amount, status: 'simulated', hash: hex(32), memo: 'Funds redirected to failure destination', createdAt: new Date().toISOString() }],
+      }
+    })
+    if (!result) return bad(res, 'Vault not found', 404)
+    res.json({ data: result.vault })
+  }))
+
+  router.get('/transactions', wrap(async (req, res) => {
+    const s = await getStore()
+    const data = await s.listActivity({ vaultId: req.query.vaultId })
+    res.json({ data, count: data.length })
+  }))
+
+  router.get('/stats', wrap(async (req, res) => {
+    const s = await getStore()
+    const vaults = await s.listVaults({ creator: req.query.creator })
+    const sum = (f) => vaults.filter(f).reduce((a, v) => a + Number(v.amount), 0)
+    const done = vaults.filter((v) => v.status !== 'active')
+    res.json({
+      data: {
+        totalVaults: vaults.length,
+        active: vaults.filter((v) => v.status === 'active').length,
+        completed: vaults.filter((v) => v.status === 'completed').length,
+        failed: vaults.filter((v) => v.status === 'failed').length,
+        totalLocked: sum((v) => v.status === 'active'),
+        totalReleased: sum((v) => v.status === 'completed'),
+        totalRedirected: sum((v) => v.status === 'failed'),
+        successRate: done.length ? Math.round((vaults.filter((v) => v.status === 'completed').length / done.length) * 100) : null,
+      },
+    })
+  }))
+
+  router.get('/cron/expire-vaults', wrap(async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store')
+
+    const cronSecret = process.env.CRON_SECRET
+    if (!cronSecret) {
+      return res.status(503).json({ error: 'Service Unavailable: CRON_SECRET is not configured' })
+    }
+
+    const authHeader = req.headers.authorization || ''
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
+    if (!token || !safeCompare(token, cronSecret)) {
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
+
+    const now = req._now || req.query.now
+    const batchSize = req.query.limit ? parseInt(req.query.limit, 10) : 100
+
+    const result = await expireOverdueVaults({ now, batchSize, store: await getStore() })
+    res.json({ processed: result.processed, remaining: result.remaining })
+  }))
+
+  app.use(['/api/v1', '/api'], router)
+  app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
+
+  return app
+}
+
+const app = createApp()
+export default app
+
+if (process.argv[1] && process.argv[1].endsWith('api/index.mjs')) {
+  const port = process.env.PORT || 3001
+  app.listen(port, () => console.log(`Disciplr API on :${port}`))
+}
