@@ -7,6 +7,8 @@ export interface AuthenticatedUser {
 export enum ApiScope {
   ReadAnalytics = 'read:analytics',
   ReadVaults = 'read:vaults',
+  WriteAnalytics = 'write:analytics',
+  WriteVaults = 'write:vaults',
 }
 
 export interface ApiKeyAuthContext {
@@ -26,6 +28,9 @@ export interface ApiKeyRecord {
   scopes: ApiScope[]
   createdAt: string
   revokedAt: string | null
+  lastUsedAt?: string | null
+  requestCount?: number
+  lastIp?: string | null
 }
 
 export interface JWTPayload {

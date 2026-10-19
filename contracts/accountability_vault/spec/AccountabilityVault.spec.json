@@ -55,12 +55,15 @@
         },
         {
             "name": "slash_on_miss",
-            "params": [],
+            "params": [
+                "String"
+            ],
             "result": "Result<(), Error>"
         },
         {
             "name": "claim",
             "params": [
+                "String",
                 "Address"
             ],
             "result": "Result<(), Error>"
@@ -68,6 +71,7 @@
         {
             "name": "claim_milestone",
             "params": [
+                "String",
                 "Address",
                 "u32"
             ],
@@ -93,7 +97,8 @@
             "name": "admin_dispute",
             "params": [
                 "String",
-                "Address"
+                "Address",
+                "u64"
             ],
             "result": "Result<(), Error>"
         },
@@ -109,13 +114,16 @@
         {
             "name": "emergency_pause",
             "params": [
-                "Address"
+                "String",
+                "Address",
+                "u64"
             ],
             "result": "Result<(), Error>"
         },
         {
             "name": "emergency_unpause",
             "params": [
+                "String",
                 "Address"
             ],
             "result": "Result<(), Error>"
@@ -130,6 +138,7 @@
         {
             "name": "reclaim_after_settlement",
             "params": [
+                "String",
                 "Address"
             ],
             "result": "Result<(), Error>"

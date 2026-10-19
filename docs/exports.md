@@ -93,20 +93,22 @@ POST /api/exports/me?scope=all&format=csv&columns={"vaults":["id","status"],"tra
 
 When `EXPORT_S3_BUCKET` and `EXPORT_S3_REGION` are both configured, completed exports are uploaded to S3 using streaming multipart upload via `@aws-sdk/lib-storage`. The export job record stores the S3 key instead of the file bytes.
 
-On poll, `GET /api/exports/status/:jobId` returns a short-lived pre-signed S3 URL instead of the local download token.
+On completion, `GET /api/exports/status/:jobId` returns a proxied download link (`/api/exports/:id/download`) rather than exposing long-lived raw S3 signed URLs directly.
 
 **Environment variables**:
 
-| Variable                   | Required | Default | Description                                    |
-| -------------------------- | -------- | ------- | ---------------------------------------------- |
-| `EXPORT_S3_BUCKET`         | No       | –       | S3 bucket name for export storage             |
-| `EXPORT_S3_REGION`         | No       | –       | AWS region for the S3 bucket                  |
-| `EXPORT_SIGNED_URL_TTL_S`  | No       | `3600`  | Signed URL expiration in seconds (1 hour)     |
+| Variable                        | Required | Default | Description                                    |
+| ------------------------------- | -------- | ------- | ---------------------------------------------- |
+| `EXPORT_S3_BUCKET`              | No       | –       | S3 bucket name for export storage             |
+| `EXPORT_S3_REGION`              | No       | –       | AWS region for the S3 bucket                  |
+| `EXPORT_SIGNED_URL_TTL_S`       | No       | `3600`  | Default fallback signed URL expiration in seconds |
+| `EXPORT_SIGNED_URL_SHORT_TTL_S` | No       | `60`    | Short-lived S3 signed URL TTL for proxied downloads |
 
 **Behavior**:
 - When S3 is configured, `result_data` remains `NULL` in the database and the `s3_key` column contains the S3 object key.
 - When S3 is not configured, `result_data` stores the generated file bytes and `s3_key` remains `NULL`.
-- The status endpoint returns either a signed S3 URL (when S3 is enabled) or a local `/api/exports/download/:token` URL (when S3 is disabled).
+- The status endpoint returns the authenticated download endpoint `/api/exports/:id/download`.
+- When accessing `GET /api/exports/:id/download`, callers are re-authenticated and verified for organization ownership. When S3 is configured, a short-lived signed URL (default 60s TTL) is issued.
 
 ## Durability and retries
 
@@ -115,14 +117,15 @@ On poll, `GET /api/exports/status/:jobId` returns a short-lived pre-signed S3 UR
 - On worker startup, any export jobs left in `pending` or `running` state are re-enqueued.
 - Request-level idempotency is supported through the `Idempotency-Key` header. Reusing the same key with a different request shape returns `409`.
 
-## Security
+## Security & Proxied Download Re-Authorization
 
-- Non-admin users only export their own data.
-- Admin exports can target a specific user or all users.
-- Status polling is restricted to the requesting user unless the caller is an admin.
-- Download links are signed and time-limited.
-- CSV cells that start with spreadsheet formula prefixes such as `=`, `+`, `-`, `@`, tab, or carriage return are prefixed with `'` to mitigate formula injection.
-- Column selection is validated against an allowlist to prevent exposure of unintended data.
+- **Authenticated Proxied Downloads (`GET /api/exports/:id/download`)**: Requires valid authentication bearer token.
+- **Per-Object Organization Ownership & Authorization**: The caller's organization ID is verified against the export job's owning organization. Cross-tenant or unauthorized access attempts are rejected with `403 Forbidden`.
+- **Short-Lived S3 Presigned Links**: S3 presigned URLs are generated with short expiration windows (e.g. 60 seconds) during proxied downloads and are never embedded in list/status responses without authorization.
+- **Audit Logging**: Every download attempt is recorded in tamper-evident audit logs (`export.download`) with the requesting principal, export job ID, and organization context.
+- Non-admin users only export and access their own organization's data. Admin exports can target specific users or global data.
+- CSV cells starting with formula prefixes (`=`, `+`, `-`, `@`, tab, carriage return) are prefixed with `'` to prevent formula injection.
+- Column selection is validated against an allowlist.
 
 ## Per-tenant export quotas
 
@@ -134,6 +137,26 @@ Each organization (or individual user when no org context is present) is limited
 - The tenant is identified by `orgId` when it is attached to the request (e.g., via `requireOrgAccess` middleware), falling back to the authenticated `userId`.
 - Quotas reset automatically at UTC midnight (no manual action required).
 - Counters are stored in the `org_quotas` table (in-memory in test environments, Knex/PostgreSQL in production).
+
+### Atomic enforcement invariant
+
+The check-and-increment is atomic: `checkAndIncrementExportQuota` reserves a
+quota slot and increments the counter as a single operation on the configured
+`OrgQuotaRepository` (`createKnexOrgQuotaRepository` uses a transaction with
+`SELECT ... FOR UPDATE`; `createInMemoryOrgQuotaRepository` uses an internal
+async mutex). A concurrent burst of export requests can never overshoot the
+daily limit — exactly `EXPORT_DAILY_QUOTA_LIMIT` requests are admitted per
+tenant per UTC day, and every admitted request consumes exactly one slot.
+
+Behavioral contract:
+
+- A limit of `0` (or below) admits no requests; the first request receives `429`.
+- Each admitted request increments the counter exactly once, even if the
+  subsequent job enqueue fails.
+- A rejected request neither creates a job nor mutates the counter.
+- The counter is keyed by the authenticated principal only; a client-supplied
+  `orgId` query parameter never changes the quota key (regression test for
+  #1387).
 
 ### 429 response
 
@@ -215,3 +238,37 @@ configureDlq({ maxSize: 200, metricsHook: myHook })
 Large exports are now stored in S3 when `EXPORT_S3_BUCKET` and `EXPORT_S3_REGION` are configured, avoiding database bloat from large binary columns. When S3 is not configured, generated bytes are stored directly in the `result_data` column for backward compatibility and simplified local development.
 
 For production deployments serving large organizations, enabling S3 storage is strongly recommended.
+
+## Regression contract
+
+The behavior below is enforced by `src/routes/exports.quota.test.ts` and
+`src/routes/exports.test.ts` and must not regress:
+
+| Invariant | Enforcement |
+| --- | --- |
+| Quota admission is atomic across concurrent requests | Concurrency test admits exactly `EXPORT_DAILY_QUOTA_LIMIT` of N parallel requests, returns `429` + `Retry-After` for the rest |
+| Quota key is the authenticated principal, never a client-supplied `orgId` | `ignores client-supplied orgId` test |
+| Quota resets at UTC midnight | `resetOrgQuotas` / fresh-bucket test in the repository unit tests |
+| Limit `0` admits nothing | Repository boundary test |
+| Failed export jobs are retried and land in the DLQ with a sanitized reason | `export.test.ts` data-fetch failure tests |
+| Completed local (non-S3) exports of every format — including `ndjson` — store result bytes and download with the correct content type | `export.test.ts` download tests (CSV BOM, JSON, NDJSON `application/x-ndjson`) |
+| Downloads re-authorize the caller; non-owner/non-admin gets `403` and no bytes | download authorization tests |
+| Empty datasets still emit valid CSV headers / empty NDJSON and mark the job `done` | empty-export tests |
+| Idempotency-Key reuse with a different request shape returns `409` | idempotency tests |
+
+### Validation commands
+
+```bash
+npm run build              # tsc typecheck + emit
+npm test                   # full Jest suite (anchored suites enabled)
+node --experimental-vm-modules node_modules/jest/bin/jest.js src/routes/exports.test.ts src/routes/exports.quota.test.ts
+```
+
+### Known limitations
+
+- Local (non-S3) exports buffer the serialized document in `result_data`;
+  streaming backpressure only applies to object-store uploads.
+- The in-memory quota repository is process-local; horizontal scale-out must
+  use the Knex repository against a shared PostgreSQL instance.
+- The concurrency regression tests run in-band against the in-memory
+  repository and therefore exercise the mutex, not a distributed lock.

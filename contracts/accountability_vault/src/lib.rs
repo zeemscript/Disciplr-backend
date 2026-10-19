@@ -14,13 +14,14 @@
 //! authorization, and deadline rules on-chain.
 //!
 //! Security invariants:
-//! - Checks-Effects-Interactions: vault state (status, staked) is persisted to
+//! - Checks-Effects-Interactions: vault state (status, staked, milestones) is persisted to
 //!   storage BEFORE any external token::Client call in `slash_on_miss`, `claim`,
-//!   and `withdraw`. This ensures the vault reaches a terminal state even if the
-//!   downstream token call panics or re-enters.
-//! - Emergency pause: a guardian address set at `create_vault` time may call
-//!   `emergency_pause` to block `slash_on_miss`, `claim`, and `withdraw` during
-//!   disputes or incidents. The same guardian may call `emergency_unpause`.
+//!   `claim_milestone`, and `withdraw`. This ensures the vault reaches a terminal
+//!   or updated state even if the downstream token call panics or re-enters.
+//! - Emergency pause: an explicit guardian address distinct from creator and
+//!   destinations set at `create_vault` time may call `emergency_pause` to block
+//!   `slash_on_miss`, `claim`, `claim_milestone`, and `withdraw` during disputes
+//!   or incidents. Pauses and disputes are bounded in duration (max 14 days).
 //! - M-of-N verifier approvals: `check_in` requires `approval_threshold` distinct
 //!   verifier (or oracle) approvals before flipping a milestone to verified.
 //!   Double-approval by the same address is rejected with `Error::AlreadyApproved`.
@@ -46,6 +47,13 @@ use soroban_sdk::{
 /// 5 years in seconds. Prevents vaults from locking storage TTL guarantees
 /// indefinitely and keeps analytics meaningful.
 const MAX_DEADLINE_HORIZON: u64 = 5 * 365 * 24 * 60 * 60;
+
+/// Maximum duration (14 days in seconds) that a guardian can pause a vault
+/// or keep it in dispute.
+pub const MAX_PAUSE_DURATION: u64 = 14 * 24 * 60 * 60;
+
+/// Maximum allowed length in bytes for a milestone title.
+pub const MAX_TITLE_LEN: usize = 128;
 
 /// Storage keys for the contract.
 #[contracttype]
@@ -145,6 +153,10 @@ pub struct Vault {
     pub guardian: Address,
     /// When true, `slash_on_miss`, `claim`, and active `withdraw` are blocked.
     pub paused: bool,
+    /// Timestamp until which the pause is active.
+    pub paused_until: u64,
+    /// Timestamp until which a dispute is active.
+    pub disputed_until: u64,
 }
 
 /// Errors surfaced to callers. Numbered for stable client mapping.
@@ -212,6 +224,10 @@ pub enum Error {
     PartiallyReleased = 28,
     /// The requested milestone has already been released.
     MilestoneAlreadyReleased = 29,
+    /// Milestone title exceeds the maximum allowed length (128 bytes).
+    TitleTooLong = 30,
+    /// Guardian cannot be the creator, success destination, or the sole verifier.
+    InvalidGuardian = 31,
 }
 
 /// Accountability vault contract entry point.
@@ -230,6 +246,7 @@ impl AccountabilityVault {
     /// to mark a milestone verified (M-of-N; must be >= 1 and <= verifiers.len()).
     /// `oracle` is an optional address that may confirm milestones in addition to
     /// the verifier set. Pass `None` for human-only verification.
+    /// `guardian` is an explicit, distinct emergency administrator address.
     pub fn create_vault(
         env: Env,
         vault_id: String,
@@ -242,6 +259,7 @@ impl AccountabilityVault {
         failure_destination: Address,
         end_timestamp: u64,
         milestones: Vec<Milestone>,
+        guardian: Address,
     ) -> Result<(), Error> {
         creator.require_auth();
 
@@ -272,9 +290,18 @@ impl AccountabilityVault {
         if failure_destination == creator {
             return Err(Error::InvalidFailureDestination);
         }
+        if guardian == creator
+            || guardian == success_destination
+            || (verifiers.len() == 1 && verifiers.get(0).map_or(false, |v| v == guardian))
+        {
+            return Err(Error::InvalidGuardian);
+        }
 
         let mut sum: i128 = 0;
         for m in milestones.iter() {
+            if m.title.len() > MAX_TITLE_LEN as u32 {
+                return Err(Error::TitleTooLong);
+            }
             if m.amount <= 0 {
                 return Err(Error::InvalidAmount);
             }
@@ -312,8 +339,10 @@ impl AccountabilityVault {
             end_timestamp,
             status: VaultStatus::Draft,
             milestones: init_milestones,
-            guardian: creator.clone(),
+            guardian,
             paused: false,
+            paused_until: 0,
+            disputed_until: 0,
         };
         env.storage().persistent().set(&key, &vault);
         Self::extend_ttl(&env, &key);
@@ -578,18 +607,23 @@ impl AccountabilityVault {
     /// ensuring the terminal state is committed even if the transfer call panics.
     pub fn slash_on_miss(env: Env, vault_id: String) -> Result<(), Error> {
         let mut vault: Vault = Self::load(&env, &vault_id)?;
+        let now = env.ledger().timestamp();
 
         // Check Disputed before NotActive so callers get the specific error code.
+        // If dispute has expired, automatically return to Active semantics.
         if vault.status == VaultStatus::Disputed {
-            return Err(Error::VaultDisputed);
+            if now <= vault.disputed_until {
+                return Err(Error::VaultDisputed);
+            }
+            vault.status = VaultStatus::Active;
         }
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
         }
-        if vault.paused {
+        if Self::is_paused(&vault, now) {
             return Err(Error::Paused);
         }
-        if env.ledger().timestamp() <= vault.end_timestamp {
+        if now <= vault.end_timestamp {
             return Err(Error::DeadlineNotReached);
         }
         if Self::all_verified(&vault) {
@@ -629,15 +663,20 @@ impl AccountabilityVault {
     pub fn claim(env: Env, vault_id: String, caller: Address) -> Result<(), Error> {
         caller.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
+        let now = env.ledger().timestamp();
 
         // Check Disputed before NotActive so callers get the specific error code.
+        // If dispute has expired, automatically return to Active semantics.
         if vault.status == VaultStatus::Disputed {
-            return Err(Error::VaultDisputed);
+            if now <= vault.disputed_until {
+                return Err(Error::VaultDisputed);
+            }
+            vault.status = VaultStatus::Active;
         }
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
         }
-        if vault.paused {
+        if Self::is_paused(&vault, now) {
             return Err(Error::Paused);
         }
         let is_authorized = caller == vault.creator || vault.verifiers.iter().any(|v| v == caller);
@@ -692,9 +731,19 @@ impl AccountabilityVault {
     ) -> Result<(), Error> {
         caller.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
+        let now = env.ledger().timestamp();
 
+        if vault.status == VaultStatus::Disputed {
+            if now <= vault.disputed_until {
+                return Err(Error::VaultDisputed);
+            }
+            vault.status = VaultStatus::Active;
+        }
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
+        }
+        if Self::is_paused(&vault, now) {
+            return Err(Error::Paused);
         }
         if caller != vault.creator && !vault.verifiers.iter().any(|v| v == caller) {
             return Err(Error::Unauthorized);
@@ -716,11 +765,22 @@ impl AccountabilityVault {
 
         let payout = milestone.amount;
 
-        // Mark the milestone as released and update vault.
+        // CEI: 1. Update state effects
         milestone.released = true;
         vault.milestones.set(index, milestone);
         vault.staked -= payout;
 
+        let completed = Self::all_released(&vault);
+        if completed {
+            vault.status = VaultStatus::Completed;
+        }
+
+        // CEI: 2. Persist state BEFORE external token call
+        let key = DataKey::Vault(vault_id.clone());
+        env.storage().persistent().set(&key, &vault);
+        Self::extend_ttl(&env, &key);
+
+        // CEI: 3. External interactions
         let client = token::Client::new(&env, &vault.token);
         client.transfer(
             &env.current_contract_address(),
@@ -736,9 +796,7 @@ impl AccountabilityVault {
             (index, payout),
         );
 
-        // Transition to Completed if every milestone has now been released.
-        if Self::all_released(&vault) {
-            vault.status = VaultStatus::Completed;
+        if completed {
             env.events().publish(
                 (
                     Symbol::new(&env, "vault_completed"),
@@ -748,9 +806,6 @@ impl AccountabilityVault {
             );
         }
 
-        let key = DataKey::Vault(vault_id.clone());
-        env.storage().persistent().set(&key, &vault);
-        Self::extend_ttl(&env, &key);
         Ok(())
     }
 
@@ -790,6 +845,7 @@ impl AccountabilityVault {
     pub fn withdraw(env: Env, vault_id: String, creator: Address) -> Result<(), Error> {
         creator.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
+        let now = env.ledger().timestamp();
 
         if creator != vault.creator {
             return Err(Error::Unauthorized);
@@ -797,7 +853,7 @@ impl AccountabilityVault {
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
         }
-        if vault.paused {
+        if Self::is_paused(&vault, now) {
             return Err(Error::Paused);
         }
         if Self::any_verified(&vault) {
@@ -828,10 +884,16 @@ impl AccountabilityVault {
     }
 
     /// Transitions an `Active` vault into `Disputed`, blocking `slash_on_miss` and
-    /// `claim` until an admin resolves the dispute.
+    /// `claim` until an admin resolves the dispute or the dispute duration expires.
     ///
     /// Only the `guardian` address may call this. The vault must be `Active`.
-    pub fn admin_dispute(env: Env, vault_id: String, admin: Address) -> Result<(), Error> {
+    /// Disputes are time-bounded up to a maximum of 14 days (`MAX_PAUSE_DURATION`).
+    pub fn admin_dispute(
+        env: Env,
+        vault_id: String,
+        admin: Address,
+        duration: u64,
+    ) -> Result<(), Error> {
         admin.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
 
@@ -842,7 +904,14 @@ impl AccountabilityVault {
             return Err(Error::NotActive);
         }
 
+        let now = env.ledger().timestamp();
+        let effective_duration = if duration == 0 {
+            MAX_PAUSE_DURATION
+        } else {
+            duration.min(MAX_PAUSE_DURATION)
+        };
         vault.status = VaultStatus::Disputed;
+        vault.disputed_until = now.saturating_add(effective_duration);
         let key = DataKey::Vault(vault_id);
         env.storage().persistent().set(&key, &vault);
         Self::extend_ttl(&env, &key);
@@ -883,6 +952,7 @@ impl AccountabilityVault {
         }
 
         vault.status = target;
+        vault.disputed_until = 0;
         let key = DataKey::Vault(vault_id);
         env.storage().persistent().set(&key, &vault);
         Self::extend_ttl(&env, &key);
@@ -894,18 +964,30 @@ impl AccountabilityVault {
         Ok(())
     }
 
-    /// Pauses the vault, blocking `slash_on_miss`, `claim`, and active `withdraw`.
+    /// Pauses the vault, blocking `slash_on_miss`, `claim`, `claim_milestone`, and active `withdraw`.
     ///
     /// Only the `guardian` address set at vault creation may call this function.
-    /// Use to halt settlement during disputes or detected incidents.
-    pub fn emergency_pause(env: Env, vault_id: String, guardian: Address) -> Result<(), Error> {
+    /// Pauses are time-bounded up to a maximum of 14 days (`MAX_PAUSE_DURATION`).
+    pub fn emergency_pause(
+        env: Env,
+        vault_id: String,
+        guardian: Address,
+        duration: u64,
+    ) -> Result<(), Error> {
         guardian.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if guardian != vault.guardian {
             return Err(Error::Unauthorized);
         }
+        let now = env.ledger().timestamp();
+        let effective_duration = if duration == 0 {
+            MAX_PAUSE_DURATION
+        } else {
+            duration.min(MAX_PAUSE_DURATION)
+        };
         vault.paused = true;
+        vault.paused_until = now.saturating_add(effective_duration);
         let key = DataKey::Vault(vault_id.clone());
         env.storage().persistent().set(&key, &vault);
         Self::extend_ttl(&env, &key);
@@ -914,7 +996,7 @@ impl AccountabilityVault {
         Ok(())
     }
 
-    /// Unpauses the vault, re-enabling `slash_on_miss`, `claim`, and `withdraw`.
+    /// Unpauses the vault, re-enabling `slash_on_miss`, `claim`, `claim_milestone`, and `withdraw`.
     ///
     /// Only the `guardian` address set at vault creation may call this function.
     pub fn emergency_unpause(env: Env, vault_id: String, guardian: Address) -> Result<(), Error> {
@@ -925,6 +1007,7 @@ impl AccountabilityVault {
             return Err(Error::Unauthorized);
         }
         vault.paused = false;
+        vault.paused_until = 0;
         let key = DataKey::Vault(vault_id.clone());
         env.storage().persistent().set(&key, &vault);
         Self::extend_ttl(&env, &key);
@@ -1073,6 +1156,10 @@ impl AccountabilityVault {
             }
         }
         false
+    }
+
+    fn is_paused(vault: &Vault, now: u64) -> bool {
+        vault.paused && now <= vault.paused_until
     }
 }
 

@@ -15,6 +15,8 @@ struct Setup {
     creator: Address,
     verifier: Address,
     failure: Address,
+    success: Address,
+    guardian: Address,
     vault_id: String,
 }
 
@@ -48,6 +50,7 @@ fn setup_with_oracle(
     let verifier = Address::generate(&env);
     let success = Address::generate(&env);
     let failure = Address::generate(&env);
+    let guardian = Address::generate(&env);
     let token_admin = Address::generate(&env);
 
     let (token, token_admin_client) = create_token(&env, &token_admin);
@@ -86,6 +89,7 @@ fn setup_with_oracle(
         &failure,
         &end,
         &milestones,
+        &guardian,
     );
 
     Setup {
@@ -95,6 +99,8 @@ fn setup_with_oracle(
         creator,
         verifier,
         failure,
+        success,
+        guardian,
         vault_id,
     }
 }
@@ -524,6 +530,8 @@ fn test_boundary_zero_amount_milestone_rejected() {
         threshold: 1,
     };
 
+    let guardian = Address::generate(&env);
+
     let result = contract.try_create_vault(
         &vault_id,
         &creator,
@@ -535,6 +543,7 @@ fn test_boundary_zero_amount_milestone_rejected() {
         &failure,
         &1_100u64,
         &milestones,
+        &guardian,
     );
     assert!(matches!(result, Err(Ok(Error::InvalidAmount))));
 }
@@ -549,6 +558,7 @@ fn test_boundary_negative_amount_milestone_rejected() {
     let verifier = Address::generate(&env);
     let success = Address::generate(&env);
     let failure = Address::generate(&env);
+    let guardian = Address::generate(&env);
     let token_admin = Address::generate(&env);
     let (token, token_admin_client) = create_token(&env, &token_admin);
     token_admin_client.mint(&creator, &100);
@@ -591,6 +601,7 @@ fn test_boundary_negative_amount_milestone_rejected() {
         &failure,
         &1_100u64,
         &milestones,
+        &guardian,
     );
     assert!(matches!(result, Err(Ok(Error::InvalidAmount))));
 }
@@ -605,6 +616,7 @@ fn test_boundary_milestone_sum_mismatch_rejected() {
     let verifier = Address::generate(&env);
     let success = Address::generate(&env);
     let failure = Address::generate(&env);
+    let guardian = Address::generate(&env);
     let token_admin = Address::generate(&env);
     let (token, token_admin_client) = create_token(&env, &token_admin);
     token_admin_client.mint(&creator, &100);
@@ -648,6 +660,7 @@ fn test_boundary_milestone_sum_mismatch_rejected() {
         &failure,
         &1_100u64,
         &milestones,
+        &guardian,
     );
     assert!(matches!(result, Err(Ok(Error::AmountMismatch))));
 }
@@ -803,3 +816,296 @@ fn test_boundary_large_total_uneven_13_way_split() {
     assert_eq!(vault.staked, 0);
     assert_eq!(vault.status, VaultStatus::Completed);
 }
+
+// ─── 13. Boundary: title length bound ────────────────────────────────
+
+#[test]
+fn test_create_vault_title_length_bound() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let verifier = Address::generate(&env);
+    let success = Address::generate(&env);
+    let failure = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let (token, _token_admin_client) = create_token(&env, &token_admin);
+    let contract_id = env.register(AccountabilityVault, ());
+    let contract = AccountabilityVaultClient::new(&env, &contract_id);
+    let vault_id = String::from_str(&env, "vault-title-test");
+
+    let guardian = Address::generate(&env);
+
+    let verifier_set = VerifierSet {
+        verifiers: vec![&env, verifier],
+        threshold: 1,
+    };
+
+    // Exactly 128 chars -> OK
+    let title_128 = String::from_str(
+        &env,
+        "012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678",
+    );
+    let milestones_ok = vec![
+        &env,
+        Milestone {
+            title: title_128,
+            amount: 100,
+            due_date: 2_000,
+            verified: false,
+            released: false,
+        },
+    ];
+
+    let res = contract.try_create_vault(
+        &vault_id,
+        &creator,
+        &verifier_set,
+        &None,
+        &token,
+        &100,
+        &success,
+        &failure,
+        &2_000,
+        &milestones_ok,
+        &guardian,
+    );
+    assert!(res.is_ok());
+
+    // 129 chars -> TitleTooLong
+    let title_129 = String::from_str(
+        &env,
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+    );
+    let milestones_err = vec![
+        &env,
+        Milestone {
+            title: title_129,
+            amount: 100,
+            due_date: 2_000,
+            verified: false,
+            released: false,
+        },
+    ];
+    let vault_id_2 = String::from_str(&env, "vault-title-test-2");
+    let res_err = contract.try_create_vault(
+        &vault_id_2,
+        &creator,
+        &verifier_set,
+        &None,
+        &token,
+        &100,
+        &success,
+        &failure,
+        &2_000,
+        &milestones_err,
+        &guardian,
+    );
+    assert_eq!(res_err, Err(Ok(Error::TitleTooLong)));
+}
+
+// ─── 14. Guardian and Pause Constraints Tests ───────────────────────
+
+#[test]
+fn test_guardian_must_differ_from_creator() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let verifier = Address::generate(&env);
+    let success = Address::generate(&env);
+    let failure = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let (token, _token_admin_client) = create_token(&env, &token_admin);
+    let contract_id = env.register(AccountabilityVault, ());
+    let contract = AccountabilityVaultClient::new(&env, &contract_id);
+    let vault_id = String::from_str(&env, "vault-guardian-test");
+
+    let verifier_set = VerifierSet {
+        verifiers: vec![&env, verifier.clone()],
+        threshold: 1,
+    };
+
+    let milestones = vec![
+        &env,
+        Milestone {
+            title: String::from_str(&env, "M1"),
+            amount: 100,
+            due_date: 2_000,
+            verified: false,
+            released: false,
+        },
+    ];
+
+    // Case 1: guardian == creator -> InvalidGuardian
+    let res = contract.try_create_vault(
+        &vault_id,
+        &creator,
+        &verifier_set,
+        &None,
+        &token,
+        &100,
+        &success,
+        &failure,
+        &2_000,
+        &milestones,
+        &creator, // guardian is creator
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidGuardian)));
+
+    // Case 2: guardian == success_destination -> InvalidGuardian
+    let res_succ = contract.try_create_vault(
+        &vault_id,
+        &creator,
+        &verifier_set,
+        &None,
+        &token,
+        &100,
+        &success,
+        &failure,
+        &2_000,
+        &milestones,
+        &success, // guardian is success destination
+    );
+    assert_eq!(res_succ, Err(Ok(Error::InvalidGuardian)));
+
+    // Case 3: guardian is sole verifier -> InvalidGuardian
+    let res_sole_verifier = contract.try_create_vault(
+        &vault_id,
+        &creator,
+        &verifier_set,
+        &None,
+        &token,
+        &100,
+        &success,
+        &failure,
+        &2_000,
+        &milestones,
+        &verifier, // guardian is the only verifier
+    );
+    assert_eq!(res_sole_verifier, Err(Ok(Error::InvalidGuardian)));
+
+    // Case 4: valid distinct guardian -> OK
+    let guardian = Address::generate(&env);
+    let res_ok = contract.try_create_vault(
+        &vault_id,
+        &creator,
+        &verifier_set,
+        &None,
+        &token,
+        &100,
+        &success,
+        &failure,
+        &2_000,
+        &milestones,
+        &guardian,
+    );
+    assert!(res_ok.is_ok());
+}
+
+#[test]
+fn test_creator_cannot_pause_or_dispute() {
+    let s = setup(&[100], &[100]);
+    s.contract.stake(&s.vault_id, &s.creator);
+
+    // Creator calling emergency_pause -> Unauthorized
+    let res_pause = s.contract.try_emergency_pause(&s.vault_id, &s.creator, &86_400);
+    assert_eq!(res_pause, Err(Ok(Error::Unauthorized)));
+
+    // Creator calling admin_dispute -> Unauthorized
+    let res_dispute = s.contract.try_admin_dispute(&s.vault_id, &s.creator, &86_400);
+    assert_eq!(res_dispute, Err(Ok(Error::Unauthorized)));
+
+    // Guardian calling emergency_pause -> Ok
+    let res_guard_pause = s.contract.try_emergency_pause(&s.vault_id, &s.guardian, &86_400);
+    assert!(res_guard_pause.is_ok());
+}
+
+#[test]
+fn test_pause_expires_and_slash_proceeds() {
+    let s = setup(&[100], &[100]);
+    s.contract.stake(&s.vault_id, &s.creator);
+
+    // Ledger timestamp is 1_000 at setup. End date is 1_100.
+    // Guardian pauses for 100 seconds: paused_until = 1_100.
+    s.contract.emergency_pause(&s.vault_id, &s.guardian, &100);
+
+    // Advance ledger to 1_050: deadline not passed yet, but also vault is paused.
+    s.env.ledger().set_timestamp(1_050);
+    let res_slash_early = s.contract.try_slash_on_miss(&s.vault_id);
+    // At 1_050, paused is active -> Paused error
+    assert_eq!(res_slash_early, Err(Ok(Error::Paused)));
+
+    // Advance ledger to 1_100 (exactly at paused_until boundary -> still paused)
+    s.env.ledger().set_timestamp(1_100);
+    let res_slash_boundary = s.contract.try_slash_on_miss(&s.vault_id);
+    assert_eq!(res_slash_boundary, Err(Ok(Error::Paused)));
+
+    // Advance ledger past paused_until and past end_date (e.g. 1_101)
+    s.env.ledger().set_timestamp(1_101);
+    // Pause has expired! slash_on_miss proceeds to slash to failure address.
+    let slash_res = s.contract.try_slash_on_miss(&s.vault_id);
+    assert!(slash_res.is_ok());
+    assert_eq!(s.token.balance(&s.failure), 100);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+}
+
+#[test]
+fn test_dispute_expires_and_slash_proceeds() {
+    let s = setup(&[100], &[100]);
+    s.contract.stake(&s.vault_id, &s.creator);
+
+    // Ledger timestamp is 1_000. End date is 1_100.
+    // Guardian puts vault into dispute for 100 seconds: disputed_until = 1_100.
+    s.contract.admin_dispute(&s.vault_id, &s.guardian, &100);
+
+    // Advance to 1_050: status is Disputed -> StatusNotActive
+    s.env.ledger().set_timestamp(1_050);
+    let res_slash_early = s.contract.try_slash_on_miss(&s.vault_id);
+    assert_eq!(res_slash_early, Err(Ok(Error::StatusNotActive)));
+
+    // Advance past disputed_until and past end_date (e.g. 1_101)
+    s.env.ledger().set_timestamp(1_101);
+    // Dispute expired! It should automatically resume / allow slash_on_miss.
+    let slash_res = s.contract.try_slash_on_miss(&s.vault_id);
+    assert!(slash_res.is_ok());
+    assert_eq!(s.token.balance(&s.failure), 100);
+    assert_eq!(s.token.balance(&s.contract.address), 0);
+}
+
+#[test]
+fn test_claim_milestone_blocked_when_paused() {
+    let s = setup(&[100, 200], &[50, 50]);
+    s.contract.stake(&s.vault_id, &s.creator);
+
+    // Verifier verifies milestone 0
+    s.contract.verify_milestone(&s.vault_id, &0, &s.verifier);
+
+    // Guardian pauses the vault
+    s.contract.emergency_pause(&s.vault_id, &s.guardian, &86_400);
+
+    let pre_creator_bal = s.token.balance(&s.creator);
+    let pre_contract_bal = s.token.balance(&s.contract.address);
+
+    // Attempt to claim milestone while paused -> Error::Paused
+    let claim_res = s.contract.try_claim_milestone(&s.vault_id, &0, &s.creator);
+    assert_eq!(claim_res, Err(Ok(Error::Paused)));
+
+    // Assert NO balance changes occurred
+    assert_eq!(s.token.balance(&s.creator), pre_creator_bal);
+    assert_eq!(s.token.balance(&s.contract.address), pre_contract_bal);
+
+    // Guardian unpauses
+    s.contract.emergency_unpause(&s.vault_id, &s.guardian);
+
+    // Now claim_milestone succeeds
+    let claim_res2 = s.contract.try_claim_milestone(&s.vault_id, &0, &s.creator);
+    assert!(claim_res2.is_ok());
+    assert_eq!(s.token.balance(&s.creator), pre_creator_bal + 50);
+}
+
+

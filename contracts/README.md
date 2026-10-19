@@ -24,14 +24,24 @@ Implements the vault lifecycle that the backend models off-chain in
 
 | Function | Purpose |
 |---|---|
-| `create_vault` | Create a `Draft` vault with milestones, verifier, and success/failure destinations. Validates amount, deadline, that milestone amounts sum to the total, and rejects obviously-degenerate salt/vault_id values (all-zero or all-ones `BytesN<32>`). |
+| `create_vault` | Create a `Draft` vault with milestones, verifiers, success/failure destinations, and a distinct guardian address. Validates amount, deadline, that milestone amounts sum to the total, that guardian is distinct from creator/success_destination and not sole verifier, and rejects degenerate parameters. |
 | `stake` | Creator transfers the SEP-41 token into the contract; `Draft` -> `Active`. |
 | `check_in` | Designated verifier confirms a milestone before its `due_date`. |
-| `slash_on_miss` | After the deadline with unverified milestones, slash funds to `failure_destination`; `Active` -> `Failed`. |
-| `claim` | When all milestones are verified, release funds to `success_destination`; `Active` -> `Completed`. |
-| `withdraw` | Cancel/refund an unfunded or unstarted vault to the creator; -> `Cancelled`. |
+| `slash_on_miss` | After the deadline with unverified milestones, slash funds to `failure_destination`; `Active` -> `Failed`. Bounded pause/dispute stops blocking once expired. |
+| `claim` | When all milestones are verified, release funds to `success_destination`; `Active` -> `Completed`. Blocked if paused. |
+| `claim_milestone` | Release funds for an individual verified milestone; blocked if paused, enforces CEI (state persisted before external transfer). |
+| `emergency_pause` | Guardian halts settlements for up to 14 days (`MAX_PAUSE_DURATION`). |
+| `admin_dispute` | Guardian enters administrative hold for up to 14 days (`MAX_PAUSE_DURATION`). |
+| `withdraw` | Cancel/refund an unfunded or unstarted vault to the creator; -> `Cancelled`. Blocked if paused. |
 | `get_vault` | Read-only accessor for the current vault record. |
 | `get_unverified_milestone_indices` | Returns `Vec<u32>` of indices for milestones that have not yet been verified, in ascending order. Used by the keeper job (`src/jobs/handlers.ts`) to determine slash targets without loading and filtering the full vault client-side. |
+
+### Security Invariants & Guardian Controls
+
+1. **Separation of Roles**: The vault guardian must be an explicit, independent address distinct from the `creator` and the `success_destination`. Furthermore, the guardian cannot be the sole member of the `verifiers` set. This prevents the creator from pausing their own vault or putting it into dispute to evade penalties.
+2. **Checks-Effects-Interactions (CEI)**: Vault state (including milestones, staked amount, and terminal status) is updated and persisted to persistent storage *before* invoking downstream token transfers (`token::Client::transfer`). This applies to `claim`, `claim_milestone`, `slash_on_miss`, and `withdraw`.
+3. **Time-Bounded Pause & Dispute**: Emergency pauses (`emergency_pause`) and administrative disputes (`admin_dispute`) are strictly bounded to at most 14 days (`MAX_PAUSE_DURATION = 14 * 86400`). When ledger time advances past the pause or dispute expiry, `slash_on_miss` and claims proceed normally without being blocked indefinitely.
+4. **Emergency Pause Enforcement**: When a vault is paused, milestone payouts (`claim_milestone`) as well as full claims (`claim`), slashes (`slash_on_miss`), and refunds (`withdraw`) are strictly blocked (`Error::Paused`), ensuring payouts cannot be drained during an active emergency.
 
 ### Token allowlist policy
 
